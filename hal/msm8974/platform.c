@@ -27,13 +27,32 @@
 #include "platform.h"
 #include "audio_extn.h"
 #include <linux/msm_audio.h>
+#include "sound/compress_params.h"
 
 #define MIXER_XML_PATH "/system/etc/mixer_paths.xml"
+#define MIXER_XML_PATH_WCD9330 "/system/etc/mixer_paths_wcd9330.xml"
 #define LIB_ACDB_LOADER "libacdbloader.so"
 #define AUDIO_DATA_BLOCK_MIXER_CTL "HDMI EDID"
 #define CVD_VERSION_MIXER_CTL "CVD Version"
 
 
+#define MAX_COMPRESS_OFFLOAD_FRAGMENT_SIZE (256 * 1024)
+#define MIN_COMPRESS_OFFLOAD_FRAGMENT_SIZE (2 * 1024)
+#define COMPRESS_OFFLOAD_FRAGMENT_SIZE_FOR_AV_STREAMING (2 * 1024)
+#define COMPRESS_OFFLOAD_FRAGMENT_SIZE (32 * 1024)
+
+/* Used in calculating fragment size for pcm offload */
+#define PCM_OFFLOAD_BUFFER_DURATION 40 /* 40 millisecs */
+
+/* MAX PCM fragment size cannot be increased  further due
+ * to flinger's cblk size of 1mb,and it has to be a multiple of
+ * 24 - lcm of channels supported by DSP
+ */
+#define MAX_PCM_OFFLOAD_FRAGMENT_SIZE (240 * 1024)
+#define MIN_PCM_OFFLOAD_FRAGMENT_SIZE (32 * 1024)
+
+#define DIV_ROUND_UP(x, y) (((x) + (y) - 1)/(y))
+#define ALIGN(x, y) ((y) * DIV_ROUND_UP((x), (y)))
 /*
  * This file will have a maximum of 38 bytes:
  *
@@ -201,6 +220,7 @@ static const char * const device_table[SND_DEVICE_MAX] = {
     [SND_DEVICE_OUT_VOICE_TX] = "voice-tx",
     [SND_DEVICE_OUT_SPEAKER_PROTECTED] = "speaker-protected",
     [SND_DEVICE_OUT_VOICE_SPEAKER_PROTECTED] = "voice-speaker-protected",
+    [SND_DEVICE_OUT_VOICE_SPEAKER_HFP] = "voice-speaker-hfp",
 
     /* Capture sound devices */
     [SND_DEVICE_IN_HANDSET_MIC] = "handset-mic",
@@ -237,6 +257,7 @@ static const char * const device_table[SND_DEVICE_MAX] = {
     [SND_DEVICE_IN_VOICE_DMIC_TMUS] = "voice-dmic-ef-tmus",
     [SND_DEVICE_IN_VOICE_SPEAKER_MIC] = "voice-speaker-mic",
     [SND_DEVICE_IN_VOICE_SPEAKER_DMIC] = "voice-speaker-dmic-ef",
+    [SND_DEVICE_IN_VOICE_SPEAKER_MIC_HFP] = "voice-speaker-mic-hfp",
     [SND_DEVICE_IN_VOICE_HEADSET_MIC] = "voice-headset-mic",
     [SND_DEVICE_IN_VOICE_TTY_FULL_HEADSET_MIC] = "voice-tty-full-headset-mic",
     [SND_DEVICE_IN_VOICE_TTY_VCO_HANDSET_MIC] = "voice-tty-vco-handset-mic",
@@ -286,6 +307,7 @@ static int acdb_device_table[SND_DEVICE_MAX] = {
     [SND_DEVICE_OUT_VOICE_TX] = 45,
     [SND_DEVICE_OUT_SPEAKER_PROTECTED] = 124,
     [SND_DEVICE_OUT_VOICE_SPEAKER_PROTECTED] = 101,
+    [SND_DEVICE_OUT_VOICE_SPEAKER_HFP] = ACDB_ID_VOICE_SPEAKER,
 
     [SND_DEVICE_IN_HANDSET_MIC] = 4,
     [SND_DEVICE_IN_HANDSET_MIC_AEC] = 106,
@@ -320,6 +342,7 @@ static int acdb_device_table[SND_DEVICE_MAX] = {
     [SND_DEVICE_IN_VOICE_DMIC] = 41,
     [SND_DEVICE_IN_VOICE_DMIC_TMUS] = ACDB_ID_VOICE_DMIC_EF_TMUS,
     [SND_DEVICE_IN_VOICE_SPEAKER_MIC] = 11,
+    [SND_DEVICE_IN_VOICE_SPEAKER_MIC_HFP] = 11,
     [SND_DEVICE_IN_VOICE_SPEAKER_DMIC] = 43,
     [SND_DEVICE_IN_VOICE_HEADSET_MIC] = 8,
     [SND_DEVICE_IN_VOICE_TTY_FULL_HEADSET_MIC] = 16,
@@ -363,6 +386,7 @@ static const struct name_to_index snd_device_name_index[SND_DEVICE_MAX] = {
     {TO_NAME_INDEX(SND_DEVICE_OUT_SPEAKER_SAFE_AND_LINE)},
     {TO_NAME_INDEX(SND_DEVICE_OUT_VOICE_HANDSET)},
     {TO_NAME_INDEX(SND_DEVICE_OUT_VOICE_SPEAKER)},
+    {TO_NAME_INDEX(SND_DEVICE_OUT_VOICE_SPEAKER_HFP)},
     {TO_NAME_INDEX(SND_DEVICE_OUT_VOICE_HEADPHONES)},
     {TO_NAME_INDEX(SND_DEVICE_OUT_VOICE_LINE)},
     {TO_NAME_INDEX(SND_DEVICE_OUT_HDMI)},
@@ -411,6 +435,7 @@ static const struct name_to_index snd_device_name_index[SND_DEVICE_MAX] = {
     {TO_NAME_INDEX(SND_DEVICE_IN_VOICE_DMIC)},
     {TO_NAME_INDEX(SND_DEVICE_IN_VOICE_DMIC_TMUS)},
     {TO_NAME_INDEX(SND_DEVICE_IN_VOICE_SPEAKER_MIC)},
+    {TO_NAME_INDEX(SND_DEVICE_IN_VOICE_SPEAKER_MIC_HFP)},
     {TO_NAME_INDEX(SND_DEVICE_IN_VOICE_SPEAKER_DMIC)},
     {TO_NAME_INDEX(SND_DEVICE_IN_VOICE_HEADSET_MIC)},
     {TO_NAME_INDEX(SND_DEVICE_IN_VOICE_TTY_FULL_HEADSET_MIC)},
@@ -948,7 +973,15 @@ void *platform_init(struct audio_device *adev)
 
         ALOGD("%s: snd_card_name: %s", __func__, snd_card_name);
 
-        adev->audio_route = audio_route_init(snd_card_num, MIXER_XML_PATH);
+        if (!strncmp(snd_card_name, "msm8226-tomtom-snd-card",
+                     sizeof("msm8226-tomtom-snd-card"))) {
+            ALOGD("%s: Call MIXER_XML_PATH_WCD9330", __func__);
+            adev->audio_route = audio_route_init(snd_card_num,
+                                                 MIXER_XML_PATH_WCD9330);
+        } else {
+            adev->audio_route = audio_route_init(snd_card_num, MIXER_XML_PATH);
+        }
+
         if (!adev->audio_route) {
             ALOGE("%s: Failed to init audio route controls, aborting.", __func__);
             goto init_failed;
@@ -1592,8 +1625,12 @@ int platform_set_mic_mute(void *platform, bool state)
                               ALL_SESSION_VSID,
                               DEFAULT_MUTE_RAMP_DURATION_MS};
 
-    if (adev->mode != AUDIO_MODE_IN_CALL)
+    if (adev->mode != AUDIO_MODE_IN_CALL &&
+        adev->mode != AUDIO_MODE_IN_COMMUNICATION)
         return 0;
+
+    if (adev->enable_hfp)
+        mixer_ctl_name = "HFP Tx Mute";
 
     set_values[0] = state;
     ctl = mixer_get_ctl_by_name(adev->mixer, mixer_ctl_name);
@@ -1770,7 +1807,11 @@ snd_device_t platform_get_output_snd_device(void *platform, audio_devices_t devi
                 snd_device = SND_DEVICE_OUT_BT_SCO;
             }
         } else if (devices & (AUDIO_DEVICE_OUT_SPEAKER | AUDIO_DEVICE_OUT_SPEAKER_SAFE)) {
-            snd_device = SND_DEVICE_OUT_VOICE_SPEAKER;
+            if (!adev->enable_hfp) {
+                snd_device = SND_DEVICE_OUT_VOICE_SPEAKER;
+            } else {
+                snd_device = SND_DEVICE_OUT_VOICE_SPEAKER_HFP;
+            }
         } else if (devices & AUDIO_DEVICE_OUT_EARPIECE) {
             if(adev->voice.hac)
                 snd_device = SND_DEVICE_OUT_VOICE_HAC_HANDSET;
@@ -1896,7 +1937,12 @@ snd_device_t platform_get_input_snd_device(void *platform, audio_devices_t out_d
 
             //select default
             if (snd_device == SND_DEVICE_NONE) {
-                snd_device = SND_DEVICE_IN_VOICE_SPEAKER_MIC;
+                if (!adev->enable_hfp) {
+                    snd_device = SND_DEVICE_IN_VOICE_SPEAKER_MIC;
+                } else {
+                    snd_device = SND_DEVICE_IN_VOICE_SPEAKER_MIC_HFP;
+                    platform_set_echo_reference(adev, true, out_device);
+                }
             }
         } else if (out_device & AUDIO_DEVICE_OUT_TELEPHONY_TX) {
             snd_device = SND_DEVICE_IN_VOICE_RX;
@@ -2512,4 +2558,241 @@ int platform_swap_lr_channels(struct audio_device *adev, bool swap_channels)
         }
     }
     return 0;
+}
+
+/* Read  offload buffer size from a property.
+ * If value is not power of 2  round it to
+ * power of 2.
+ */
+uint32_t platform_get_compress_offload_buffer_size(audio_offload_info_t* info)
+{
+    char value[PROPERTY_VALUE_MAX] = {0};
+    uint32_t fragment_size = COMPRESS_OFFLOAD_FRAGMENT_SIZE;
+    if((property_get("audio.offload.buffer.size.kb", value, "")) &&
+            atoi(value)) {
+        fragment_size =  atoi(value) * 1024;
+    }
+
+#ifdef FLAC_OFFLOAD_ENABLED
+    // For FLAC use max size since it is loss less, and has sampling rates
+    // upto 192kHZ
+    if (info != NULL && !info->has_video &&
+        info->format == AUDIO_FORMAT_FLAC) {
+       fragment_size = MAX_COMPRESS_OFFLOAD_FRAGMENT_SIZE;
+       ALOGV("FLAC fragment size %d", fragment_size);
+    }
+#endif
+
+    if (info != NULL && info->has_video && info->is_streaming) {
+        fragment_size = COMPRESS_OFFLOAD_FRAGMENT_SIZE_FOR_AV_STREAMING;
+        ALOGV("%s: offload fragment size reduced for AV streaming to %d",
+               __func__, fragment_size);
+    }
+
+    fragment_size = ALIGN( fragment_size, 1024);
+
+    if(fragment_size < MIN_COMPRESS_OFFLOAD_FRAGMENT_SIZE)
+        fragment_size = MIN_COMPRESS_OFFLOAD_FRAGMENT_SIZE;
+    else if(fragment_size > MAX_COMPRESS_OFFLOAD_FRAGMENT_SIZE)
+        fragment_size = MAX_COMPRESS_OFFLOAD_FRAGMENT_SIZE;
+    ALOGV("%s: fragment_size %d", __func__, fragment_size);
+    return fragment_size;
+}
+
+#ifdef PCM_OFFLOAD_ENABLED
+uint32_t platform_get_pcm_offload_buffer_size(audio_offload_info_t* info)
+{
+    uint32_t fragment_size = 0;
+    uint32_t bits_per_sample = 16;
+    uint32_t pcm_offload_time = PCM_OFFLOAD_BUFFER_DURATION;
+
+    if (info->format == AUDIO_FORMAT_PCM_24_BIT_OFFLOAD) {
+        bits_per_sample = 32;
+    }
+
+    //duration is set to 40 ms worth of stereo data at 48Khz
+    //with 16 bit per sample, modify this when the channel
+    //configuration is different
+    fragment_size = (pcm_offload_time
+                     * info->sample_rate
+                     * (bits_per_sample >> 3)
+                     * popcount(info->channel_mask))/1000;
+    // To have same PCM samples for all channels, the buffer size requires to
+    // be multiple of (number of channels * bytes per sample)
+    // For writes to succeed, the buffer must be written at address which is multiple of 32
+    // Alignment of 96 satsfies both of the above requirements
+    fragment_size = ALIGN(fragment_size, 96);
+    if(fragment_size < MIN_PCM_OFFLOAD_FRAGMENT_SIZE)
+        fragment_size = MIN_PCM_OFFLOAD_FRAGMENT_SIZE;
+    else if(fragment_size > MAX_PCM_OFFLOAD_FRAGMENT_SIZE)
+        fragment_size = MAX_PCM_OFFLOAD_FRAGMENT_SIZE;
+
+    ALOGI("PCM offload Fragment size to %d bytes", fragment_size);
+    return fragment_size;
+}
+#endif
+
+int platform_set_codec_backend_cfg(struct audio_device* adev,
+                         unsigned int bit_width, unsigned int sample_rate)
+{
+    ALOGV("%s bit width: %d, sample rate: %d", __func__, bit_width, sample_rate);
+
+    int ret = 0;
+    if (bit_width != adev->cur_codec_backend_bit_width) {
+        const char * mixer_ctl_name = "SLIM_0_RX Format";
+        struct  mixer_ctl *ctl;
+        ctl = mixer_get_ctl_by_name(adev->mixer, mixer_ctl_name);
+        if (!ctl) {
+            ALOGE("%s: Could not get ctl for mixer command - %s",
+                    __func__, mixer_ctl_name);
+            return -EINVAL;
+        }
+
+        if (bit_width == 24) {
+                mixer_ctl_set_enum_by_string(ctl, "S24_LE");
+        } else {
+            mixer_ctl_set_enum_by_string(ctl, "S16_LE");
+            sample_rate = CODEC_BACKEND_DEFAULT_SAMPLE_RATE;
+        }
+        adev->cur_codec_backend_bit_width = bit_width;
+        ALOGE("Backend bit width is set to %d ", bit_width);
+    }
+
+    /*
+     * Backend sample rate configuration follows:
+     * 16 bit playback - 48khz for streams at any valid sample rate
+     * 24 bit playback - 48khz for stream sample rate less than 48khz
+     * 24 bit playback - 96khz for sample rate range of 48khz to 96khz
+     * 24 bit playback - 192khz for sample rate range of 96khz to 192 khz
+     * Upper limit is inclusive in the sample rate range.
+     */
+    // TODO: This has to be more dynamic based on policy file
+    if (sample_rate != adev->cur_codec_backend_samplerate) {
+            char *rate_str = NULL;
+            const char * mixer_ctl_name = "SLIM_0_RX SampleRate";
+            struct  mixer_ctl *ctl;
+
+            switch (sample_rate) {
+            case 8000:
+            case 11025:
+            case 16000:
+            case 22050:
+            case 32000:
+            case 44100:
+            case 48000:
+                rate_str = "KHZ_48";
+                break;
+            case 64000:
+            case 88200:
+            case 96000:
+                rate_str = "KHZ_96";
+                break;
+            case 176400:
+            case 192000:
+                rate_str = "KHZ_192";
+                break;
+            default:
+                rate_str = "KHZ_48";
+                break;
+            }
+
+            ctl = mixer_get_ctl_by_name(adev->mixer, mixer_ctl_name);
+            if(!ctl) {
+                ALOGE("%s: Could not get ctl for mixer command - %s",
+                    __func__, mixer_ctl_name);
+                return -EINVAL;
+            }
+
+            ALOGV("Set sample rate as rate_str = %s", rate_str);
+            mixer_ctl_set_enum_by_string(ctl, rate_str);
+            adev->cur_codec_backend_samplerate = sample_rate;
+    }
+
+    return ret;
+}
+
+bool platform_check_codec_backend_cfg(struct audio_device* adev,
+                                   struct audio_usecase* usecase,
+                                   unsigned int* new_bit_width,
+                                   unsigned int* new_sample_rate)
+{
+    bool backend_change = false;
+    struct listnode *node;
+    struct stream_out *out = NULL;
+    unsigned int bit_width = CODEC_BACKEND_DEFAULT_BIT_WIDTH;
+    unsigned int sample_rate = CODEC_BACKEND_DEFAULT_SAMPLE_RATE;
+
+    // For voice calls use default configuration
+    // force routing is not required here, caller will do it anyway
+    if (voice_is_in_call(adev) || adev->mode == AUDIO_MODE_IN_COMMUNICATION) {
+        ALOGW("%s:Use default bw and sr for voice/voip calls ",__func__);
+        bit_width = CODEC_BACKEND_DEFAULT_BIT_WIDTH;
+        sample_rate =  CODEC_BACKEND_DEFAULT_SAMPLE_RATE;
+    } else {
+        /*
+         * The backend should be configured at highest bit width and/or
+         * sample rate amongst all playback usecases.
+         * If the selected sample rate and/or bit width differ with
+         * current backend sample rate and/or bit width, then, we set the
+         * backend re-configuration flag.
+         *
+         * Exception: 16 bit playbacks is allowed through 16 bit/48 khz backend only
+         */
+        list_for_each(node, &adev->usecase_list) {
+            struct audio_usecase *curr_usecase;
+            curr_usecase = node_to_item(node, struct audio_usecase, list);
+            if (curr_usecase->type == PCM_PLAYBACK) {
+                struct stream_out *out =
+                           (struct stream_out*) curr_usecase->stream.out;
+                if (out != NULL ) {
+                    ALOGV("Offload playback running bw %d sr %d",
+                              out->bit_width, out->sample_rate);
+                        if (bit_width < out->bit_width)
+                            bit_width = out->bit_width;
+                        if (sample_rate < out->sample_rate)
+                            sample_rate = out->sample_rate;
+                }
+            }
+        }
+    }
+
+    // 24 bit playback on speakers and all 16 bit playbacks is allowed through
+    // 16 bit/48 khz backend only
+    if ((16 == bit_width) ||
+        ((24 == bit_width) &&
+         (usecase->stream.out->devices & AUDIO_DEVICE_OUT_SPEAKER))) {
+        sample_rate = CODEC_BACKEND_DEFAULT_SAMPLE_RATE;
+    }
+    // Force routing if the expected bitwdith or samplerate
+    // is not same as current backend comfiguration
+    if ((bit_width != adev->cur_codec_backend_bit_width) ||
+        (sample_rate != adev->cur_codec_backend_samplerate)) {
+        *new_bit_width = bit_width;
+        *new_sample_rate = sample_rate;
+        backend_change = true;
+        ALOGI("%s Codec backend needs to be updated. new bit width: %d new sample rate: %d",
+               __func__, *new_bit_width, *new_sample_rate);
+    }
+
+    return backend_change;
+}
+
+bool platform_check_and_set_codec_backend_cfg(struct audio_device* adev, struct audio_usecase *usecase)
+{
+    ALOGV("platform_check_and_set_codec_backend_cfg usecase = %d",usecase->id );
+
+    unsigned int new_bit_width, old_bit_width;
+    unsigned int new_sample_rate, old_sample_rate;
+
+    new_bit_width = old_bit_width = adev->cur_codec_backend_bit_width;
+    new_sample_rate = old_sample_rate = adev->cur_codec_backend_samplerate;
+
+    ALOGW("Codec backend bitwidth %d, samplerate %d", old_bit_width, old_sample_rate);
+    if (platform_check_codec_backend_cfg(adev, usecase,
+                                      &new_bit_width, &new_sample_rate)) {
+        platform_set_codec_backend_cfg(adev, new_bit_width, new_sample_rate);
+        return true;
+    }
+
+    return false;
 }
